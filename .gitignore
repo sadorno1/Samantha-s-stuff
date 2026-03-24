@@ -6,7 +6,10 @@ archive
 *.tmp
 .DS_Store
 .venv
-
+FER2013
+Autism-emotion-recognition-dataset
+POSTER_V2/data
+POSTER_V2
 # --- Virtual Environments ---
 # Blocks the most common venv folder names
 .venv/

@@ -1,34 +1,4 @@
-"""
-rafdb_fer_bench.py
-
-Train + evaluate multiple FER models on RAF-DB (Kaggle ImageFolder format):
-- ResNet-18
-- ResNet-50
-- EfficientNet-B0
-- Swin-Tiny
-- ViT (B/16)
-
-Metrics:
-- Top-1 accuracy
-- Macro F1
-- Per-class F1
-- Params, model size (MB)
-- Inference latency (ms/img) and throughput (img/s)
-
-Usage example:
-python rafdb_fer_bench.py \
-  --train_dir "archive/DATASET/train" \
-  --val_dir "archive/DATASET/test" \
-  --models resnet18 resnet50 efficientnet_b0 swin_t vit_b_16 \
-  --epochs 10 --batch_size 64 --lr 3e-4
-
-Notes:
-- Class folders must be 1..7 (or any names); ImageFolder assigns them in sorted order.
-- For fair speed benchmarking, inference uses the same input size for all models.
-"""
-
 import argparse
-import os
 import time
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
@@ -37,7 +7,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-
 import torchvision
 from torchvision import transforms
 from torchvision.datasets import ImageFolder
@@ -53,9 +22,6 @@ def compute_confusion_matrix(y_true: torch.Tensor, y_pred: torch.Tensor, num_cla
     return cm
 
 def f1_from_confusion(cm: torch.Tensor) -> Tuple[float, List[float]]:
-    """
-    Returns macro-F1 and per-class F1 from confusion matrix (rows=true, cols=pred).
-    """
     num_classes = cm.size(0)
     per_f1 = []
     for c in range(num_classes):
@@ -77,8 +43,14 @@ def count_params(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
 
 def model_size_mb(model: nn.Module) -> float:
-    # Rough size = parameters * 4 bytes (fp32). If using AMP/FP16 this differs, but still useful.
     return (count_params(model) * 4) / (1024 ** 2)
+
+def compute_class_weights(dataset: ImageFolder, num_classes: int) -> torch.Tensor:
+    counts = torch.zeros(num_classes, dtype=torch.float32)
+    for _, label in dataset.samples:
+        counts[label] += 1
+    weights = counts.sum() / (counts * num_classes)
+    return weights
 
 # ---------------------------
 # Model factory
@@ -139,7 +111,7 @@ def train_one_epoch(model: nn.Module, loader: DataLoader, criterion, optimizer, 
 
         optimizer.zero_grad(set_to_none=True)
 
-        with torch.cuda.amp.autocast(enabled=scaler is not None):
+        with torch.amp.autocast("cuda", enabled=scaler is not None):
             logits = model(imgs)
             loss = criterion(logits, labels)
 
@@ -183,14 +155,9 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, num_cla
 
 @torch.no_grad()
 def benchmark_inference(model: nn.Module, device: torch.device, input_shape=(1, 3, 224, 224), iters: int = 200, warmup: int = 30) -> Tuple[float, float]:
-    """
-    Returns (latency_ms_per_image, images_per_second).
-    Benchmarks forward pass with no gradient. Uses CUDA sync for accurate timing.
-    """
     model.eval()
     x = torch.randn(*input_shape, device=device)
 
-    # Warmup
     for _ in range(warmup):
         _ = model(x)
     if device.type == "cuda":
@@ -204,7 +171,7 @@ def benchmark_inference(model: nn.Module, device: torch.device, input_shape=(1, 
     t1 = time.perf_counter()
 
     total = t1 - t0
-    latency = (total / iters) * 1000.0  # ms per batch
+    latency = (total / iters) * 1000.0
     bs = input_shape[0]
     latency_per_img = latency / bs
     ips = (iters * bs) / total
@@ -222,24 +189,32 @@ def main():
         "--models",
         type=str,
         nargs="+",
-        default=["resnet18", "resnet50", "efficientnet_b0", "swin_t", "vit_b_16"],
+        default=["efficientnet_b0"],
         help="Choose from: resnet18 resnet50 efficientnet_b0 swin_t vit_b_16",
     )
 
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--img_size", type=int, default=224)
 
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--label_smoothing", type=float, default=0.1)
+
     parser.add_argument("--pretrained", action="store_true", default=True)
     parser.add_argument("--no_pretrained", dest="pretrained", action="store_false")
     parser.add_argument("--amp", action="store_true", default=True)
     parser.add_argument("--no_amp", dest="amp", action="store_false")
 
+    parser.add_argument("--class_weighted_loss", action="store_true", default=True)
+    parser.add_argument("--no_class_weighted_loss", dest="class_weighted_loss", action="store_false")
+
+    parser.add_argument("--scheduler", type=str, default="cosine", choices=["none", "cosine", "plateau"])
     parser.add_argument("--bench_iters", type=int, default=200)
     parser.add_argument("--seed", type=int, default=42)
+
+    parser.add_argument("--select_best_by", type=str, default="macro_f1", choices=["macro_f1", "acc"])
 
     args = parser.parse_args()
 
@@ -254,9 +229,10 @@ def main():
     train_tf = transforms.Compose([
         transforms.Resize((args.img_size, args.img_size)),
         transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomRotation(degrees=10),
-        transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.15, hue=0.02),
+        transforms.RandomRotation(degrees=12),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.03),
         transforms.ToTensor(),
+        transforms.RandomErasing(p=0.25, scale=(0.02, 0.12), ratio=(0.3, 3.3), value="random"),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
@@ -299,15 +275,33 @@ def main():
 
         model = build_model(name, num_classes=num_classes, pretrained=args.pretrained).to(device)
 
-        # Loss + optimizer
-        criterion = nn.CrossEntropyLoss()
+        # Loss
+        class_weights = None
+        if args.class_weighted_loss:
+            class_weights = compute_class_weights(train_ds, num_classes).to(device)
+            print("Using class weights:", [round(x, 4) for x in class_weights.detach().cpu().tolist()])
+
+        criterion = nn.CrossEntropyLoss(
+            weight=class_weights,
+            label_smoothing=args.label_smoothing
+        )
+
         optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-        scaler = torch.cuda.amp.GradScaler() if (device.type == "cuda" and args.amp) else None
+        # Scheduler
+        if args.scheduler == "cosine":
+            scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+        elif args.scheduler == "plateau":
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=5)
+        else:
+            scheduler = None
+
+        scaler = torch.amp.GradScaler("cuda") if (device.type == "cuda" and args.amp) else None
 
         # Train
-        best_acc = -1.0
+        best_score = -1.0
         best_state = None
+        best_epoch = -1
 
         for epoch in range(1, args.epochs + 1):
             t0 = time.perf_counter()
@@ -315,11 +309,25 @@ def main():
             acc, macro_f1, per_f1 = evaluate(model, val_loader, device, num_classes)
             t1 = time.perf_counter()
 
-            if acc > best_acc:
-                best_acc = acc
-                best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+            score = macro_f1 if args.select_best_by == "macro_f1" else acc
+            if score > best_score:
+                if score > best_score:
+                    best_score = score
+                    best_epoch = epoch
+                    best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+                    torch.save(best_state, "efficientnet_b0_rafdb_best.pth")
+            if scheduler is not None:
+                if args.scheduler == "plateau":
+                    scheduler.step(macro_f1)
+                else:
+                    scheduler.step()
 
-            print(f"Epoch {epoch:02d}/{args.epochs} | loss={loss:.4f} | val_acc={acc:.4f} | macro_f1={macro_f1:.4f} | time={(t1 - t0):.1f}s")
+            current_lr = optimizer.param_groups[0]["lr"]
+            print(
+                f"Epoch {epoch:02d}/{args.epochs} | "
+                f"loss={loss:.4f} | val_acc={acc:.4f} | macro_f1={macro_f1:.4f} | "
+                f"lr={current_lr:.6f} | time={(t1 - t0):.1f}s"
+            )
 
         # Load best
         if best_state is not None:
@@ -328,7 +336,6 @@ def main():
         # Final eval
         acc, macro_f1, per_f1 = evaluate(model, val_loader, device, num_classes)
 
-        # Speed benchmark (batch=1)
         latency_ms, ips = benchmark_inference(
             model,
             device,
@@ -350,7 +357,8 @@ def main():
             size_mb=size_mb,
         )
 
-        print(f"\nBest Val Metrics for {name}:")
+        print(f"\nBest checkpoint epoch for {name}: {best_epoch}")
+        print(f"Best Val Metrics for {name}:")
         print(f"  Accuracy     : {acc:.4f}")
         print(f"  Macro F1     : {macro_f1:.4f}")
         print(f"  Per-class F1 : {[round(x, 4) for x in per_f1]}")
@@ -359,7 +367,6 @@ def main():
         print(f"  Latency (ms) : {latency_ms:.2f} ms/img")
         print(f"  Throughput   : {ips:.2f} img/s")
 
-    # Summary table
     print("\n" + "=" * 80)
     print("SUMMARY (best checkpoint per model on val set)")
     header = f"{'Model':18s}  {'Acc':>6s}  {'MacroF1':>7s}  {'Params(M)':>9s}  {'Size(MB)':>8s}  {'ms/img':>7s}  {'img/s':>7s}"
